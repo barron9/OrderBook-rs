@@ -117,7 +117,7 @@ pub struct RepricingResult {
 /// * `side` - The side of the order (Buy or Sell)
 /// * `best_bid` - Current best bid price
 /// * `best_ask` - Current best ask price
-/// * `mid_price` - Current mid price
+/// * `mid_price` - Current mid price in integer units
 /// * `last_trade` - Last trade price
 ///
 /// # Returns
@@ -128,13 +128,13 @@ pub fn calculate_pegged_price(
     _side: Side,
     best_bid: Option<u128>,
     best_ask: Option<u128>,
-    mid_price: Option<f64>,
+    mid_price: Option<u128>,
     last_trade: Option<u128>,
 ) -> Option<u128> {
     let reference_price = match reference_type {
         PegReferenceType::BestBid => best_bid?,
         PegReferenceType::BestAsk => best_ask?,
-        PegReferenceType::MidPrice => mid_price.map(|p| p as u128)?,
+        PegReferenceType::MidPrice => mid_price?,
         PegReferenceType::LastTrade => last_trade?,
     };
 
@@ -259,7 +259,7 @@ mod tests {
             Side::Buy,
             Some(100),
             Some(105),
-            Some(102.5),
+            Some(102),
             Some(101),
         );
         assert_eq!(price, Some(105)); // 100 + 5
@@ -273,7 +273,7 @@ mod tests {
             Side::Sell,
             Some(100),
             Some(105),
-            Some(102.5),
+            Some(102),
             Some(101),
         );
         assert_eq!(price, Some(102)); // 105 - 3
@@ -287,10 +287,10 @@ mod tests {
             Side::Buy,
             Some(100),
             Some(110),
-            Some(105.0),
+            Some(105),
             Some(103),
         );
-        assert_eq!(price, Some(105)); // mid price
+        assert_eq!(price, Some(105)); // mid price (105)
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
             Side::Buy,
             Some(100),
             Some(105),
-            Some(102.5),
+            Some(102),
             Some(101),
         );
         assert_eq!(price, Some(103)); // 101 + 2
@@ -315,7 +315,7 @@ mod tests {
             Side::Buy,
             None, // No best bid
             Some(105),
-            Some(102.5),
+            Some(102),
             Some(101),
         );
         assert_eq!(price, None);
@@ -329,7 +329,7 @@ mod tests {
             Side::Buy,
             Some(100),
             Some(105),
-            Some(102.5),
+            Some(102),
             Some(101),
         );
         assert_eq!(price, Some(1)); // Minimum price is 1

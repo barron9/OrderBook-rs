@@ -2456,7 +2456,7 @@ where
 
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
-        let mid_price = self.mid_price();
+        let mid_price = self.mid_price().map(|p| p as u128);
         let last_trade = if self.has_traded.load(Ordering::Relaxed) {
             Some(self.last_trade_price.load())
         } else {
