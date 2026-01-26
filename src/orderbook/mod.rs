@@ -27,6 +27,9 @@ mod tests;
 /// Trade-related types including TradeResult and TradeListener for monitoring order executions.
 pub mod trade;
 
+/// Re-pricing logic for special order types (PeggedOrder and TrailingStop).
+pub mod repricing;
+
 pub use book::OrderBook;
 pub use error::OrderBookError;
 pub use implied_volatility::{
@@ -35,6 +38,7 @@ pub use implied_volatility::{
 };
 pub use iterators::LevelInfo;
 pub use market_impact::{MarketImpact, OrderSimulation};
+pub use repricing::{RepricingOperations, RepricingResult, SpecialOrderTracker};
 pub use snapshot::{
     EnrichedSnapshot, MetricFlags, ORDERBOOK_SNAPSHOT_FORMAT_VERSION, OrderBookSnapshot,
     OrderBookSnapshotPackage,

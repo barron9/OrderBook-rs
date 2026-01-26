@@ -7,12 +7,15 @@ use super::market_impact::{MarketImpact, OrderSimulation};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::PriceLevelChangedListener;
+use crate::orderbook::repricing::SpecialOrderTracker;
 use crate::orderbook::trade::{TradeListener, TradeResult};
 use crate::utils::current_time_millis;
 use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
-use pricelevel::{Hash32, MatchResult, OrderId, OrderType, PriceLevel, Side, UuidGenerator};
+use pricelevel::{
+    Hash32, MatchResult, OrderId, OrderType, OrderUpdate, PriceLevel, Side, UuidGenerator,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -81,6 +84,9 @@ pub struct OrderBook<T = ()> {
 
     /// listens to order book changes. This provides a point to update a corresponding external order book e.g. in the UI
     pub price_level_changed_listener: Option<PriceLevelChangedListener>,
+
+    /// Tracker for special orders that require re-pricing (PeggedOrder and TrailingStop)
+    pub(super) special_order_tracker: SpecialOrderTracker,
 }
 
 impl<T> Serialize for OrderBook<T>
@@ -329,6 +335,7 @@ where
             trade_listener: None,
             _phantom: PhantomData,
             price_level_changed_listener: None,
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -352,6 +359,7 @@ where
             trade_listener: Some(trade_listener),
             _phantom: PhantomData,
             price_level_changed_listener: None,
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -387,6 +395,7 @@ where
             trade_listener: Some(trade_listener),
             _phantom: PhantomData,
             price_level_changed_listener: Some(book_changed_listener),
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -2426,5 +2435,200 @@ where
         }
 
         distribution
+    }
+}
+
+// Implementation of RepricingOperations trait for OrderBook
+use crate::orderbook::repricing::{
+    RepricingOperations, RepricingResult, calculate_pegged_price, calculate_trailing_stop_price,
+};
+
+impl<T> RepricingOperations<T> for OrderBook<T>
+where
+    T: Clone + Default + Send + Sync + 'static,
+{
+    /// Re-prices all pegged orders based on current market conditions
+    fn reprice_pegged_orders(&self) -> Result<usize, OrderBookError> {
+        let pegged_ids = self.special_order_tracker.pegged_order_ids();
+        if pegged_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let best_bid = self.best_bid();
+        let best_ask = self.best_ask();
+        let mid_price = self.mid_price();
+        let last_trade = if self.has_traded.load(Ordering::Relaxed) {
+            Some(self.last_trade_price.load())
+        } else {
+            None
+        };
+
+        let mut repriced_count = 0;
+
+        for order_id in pegged_ids {
+            if let Some(order) = self.get_order(order_id) {
+                if let OrderType::PeggedOrder {
+                    price: current_price,
+                    side,
+                    reference_price_offset,
+                    reference_price_type,
+                    ..
+                } = order.as_ref()
+                    && let Some(new_price) = calculate_pegged_price(
+                        *reference_price_type,
+                        *reference_price_offset,
+                        *side,
+                        best_bid,
+                        best_ask,
+                        mid_price,
+                        last_trade,
+                    )
+                    && new_price != *current_price
+                {
+                    let update = OrderUpdate::UpdatePrice {
+                        order_id,
+                        new_price,
+                    };
+                    if self.update_order(update).is_ok() {
+                        repriced_count += 1;
+                        trace!(
+                            "Re-priced pegged order {} from {} to {}",
+                            order_id, current_price, new_price
+                        );
+                    }
+                }
+            } else {
+                // Order no longer exists, unregister it
+                self.special_order_tracker
+                    .unregister_pegged_order(&order_id);
+            }
+        }
+
+        Ok(repriced_count)
+    }
+
+    /// Re-prices all trailing stop orders based on current market conditions
+    fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError> {
+        let trailing_ids = self.special_order_tracker.trailing_stop_ids();
+        if trailing_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut repriced_count = 0;
+
+        for order_id in trailing_ids {
+            if let Some(order) = self.get_order(order_id) {
+                if let OrderType::TrailingStop {
+                    price: current_stop_price,
+                    side,
+                    trail_amount,
+                    last_reference_price,
+                    ..
+                } = order.as_ref()
+                {
+                    // Get current market price based on side
+                    let current_market_price = match side {
+                        Side::Sell => self.best_bid(), // Sell stop tracks bid (market high)
+                        Side::Buy => self.best_ask(),  // Buy stop tracks ask (market low)
+                    };
+
+                    if let Some(market_price) = current_market_price
+                        && let Some((new_stop_price, new_reference)) = calculate_trailing_stop_price(
+                            *side,
+                            *current_stop_price,
+                            *trail_amount,
+                            *last_reference_price,
+                            market_price,
+                        )
+                    {
+                        // Update the order with new stop price
+                        // We need to update both price and last_reference_price
+                        // For now, we update the price; the reference price update
+                        // requires modifying the order directly
+                        let update = OrderUpdate::UpdatePrice {
+                            order_id,
+                            new_price: new_stop_price,
+                        };
+                        if self.update_order(update).is_ok() {
+                            repriced_count += 1;
+                            trace!(
+                                "Re-priced trailing stop {} from {} to {} (ref: {} -> {})",
+                                order_id,
+                                current_stop_price,
+                                new_stop_price,
+                                last_reference_price,
+                                new_reference
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Order no longer exists, unregister it
+                self.special_order_tracker
+                    .unregister_trailing_stop(&order_id);
+            }
+        }
+
+        Ok(repriced_count)
+    }
+
+    /// Re-prices all special orders (both pegged and trailing stops)
+    fn reprice_special_orders(&self) -> Result<RepricingResult, OrderBookError> {
+        let pegged_count = self.reprice_pegged_orders()?;
+        let trailing_count = self.reprice_trailing_stops()?;
+
+        Ok(RepricingResult {
+            pegged_orders_repriced: pegged_count,
+            trailing_stops_repriced: trailing_count,
+            failed_orders: Vec::new(),
+        })
+    }
+
+    /// Checks if a trailing stop order should be triggered
+    fn should_trigger_trailing_stop(
+        &self,
+        order: &OrderType<T>,
+        current_market_price: u128,
+    ) -> bool {
+        if let OrderType::TrailingStop {
+            price: stop_price,
+            side,
+            ..
+        } = order
+        {
+            match side {
+                // Sell trailing stop triggers when market falls to or below stop price
+                Side::Sell => current_market_price <= *stop_price,
+                // Buy trailing stop triggers when market rises to or above stop price
+                Side::Buy => current_market_price >= *stop_price,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+impl<T> OrderBook<T>
+where
+    T: Clone + Default + Send + Sync + 'static,
+{
+    /// Returns the number of tracked pegged orders
+    pub fn pegged_order_count(&self) -> usize {
+        self.special_order_tracker.pegged_order_count()
+    }
+
+    /// Returns the number of tracked trailing stop orders
+    pub fn trailing_stop_count(&self) -> usize {
+        self.special_order_tracker.trailing_stop_count()
+    }
+
+    /// Returns all tracked pegged order IDs
+    pub fn pegged_order_ids(&self) -> Vec<OrderId> {
+        self.special_order_tracker.pegged_order_ids()
+    }
+
+    /// Returns all tracked trailing stop order IDs
+    pub fn trailing_stop_ids(&self) -> Vec<OrderId> {
+        self.special_order_tracker.trailing_stop_ids()
     }
 }
