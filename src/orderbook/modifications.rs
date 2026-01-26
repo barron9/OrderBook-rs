@@ -477,6 +477,15 @@ where
                 // Remove the order from the locations map
                 self.order_locations.remove(&order_id);
 
+                // Unregister special orders from re-pricing tracking
+                #[cfg(feature = "special_orders")]
+                {
+                    self.special_order_tracker
+                        .unregister_pegged_order(&order_id);
+                    self.special_order_tracker
+                        .unregister_trailing_stop(&order_id);
+                }
+
                 // If the level became empty, remove it
                 if empty_level {
                     price_levels.remove(&price);
@@ -592,6 +601,18 @@ where
             }
             self.order_locations
                 .insert(unit_order_arc.id(), (price, side));
+
+            // Register special orders for re-pricing tracking
+            #[cfg(feature = "special_orders")]
+            match &order {
+                OrderType::PeggedOrder { id, .. } => {
+                    self.special_order_tracker.register_pegged_order(*id);
+                }
+                OrderType::TrailingStop { id, .. } => {
+                    self.special_order_tracker.register_trailing_stop(*id);
+                }
+                _ => {}
+            }
 
             // Convert back to generic type for return
             let generic_order = self.convert_from_unit_type(&unit_order_arc);

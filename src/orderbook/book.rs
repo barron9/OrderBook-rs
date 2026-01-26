@@ -7,11 +7,16 @@ use super::market_impact::{MarketImpact, OrderSimulation};
 use super::snapshot::{EnrichedSnapshot, MetricFlags, OrderBookSnapshot, OrderBookSnapshotPackage};
 use super::statistics::{DepthStats, DistributionBin};
 use crate::orderbook::book_change_event::PriceLevelChangedListener;
+#[cfg(feature = "special_orders")]
+use crate::orderbook::repricing::SpecialOrderTracker;
 use crate::orderbook::trade::{TradeListener, TradeResult};
 use crate::utils::current_time_millis;
+use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
-use pricelevel::{MatchResult, OrderId, OrderType, PriceLevel, Side, UuidGenerator};
+#[cfg(feature = "special_orders")]
+use pricelevel::OrderUpdate;
+use pricelevel::{Hash32, MatchResult, OrderId, OrderType, PriceLevel, Side, UuidGenerator};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -34,23 +39,31 @@ pub struct OrderBook<T = ()> {
     /// The map is keyed by price levels and stores Arc references to PriceLevel instances
     /// Using SkipMap provides O(log N) operations with automatic ordering, eliminating
     /// the need to sort prices during matching (optimization from O(N log N) to O(M log N))
-    pub(super) bids: SkipMap<u64, Arc<PriceLevel>>,
+    pub(super) bids: SkipMap<u128, Arc<PriceLevel>>,
 
     /// Ask side price levels (sell orders), stored in a concurrent ordered map (skip list)
     /// The map is keyed by price levels and stores Arc references to PriceLevel instances
     /// Using SkipMap provides O(log N) operations with automatic ordering, eliminating
     /// the need to sort prices during matching (optimization from O(N log N) to O(M log N))
-    pub(super) asks: SkipMap<u64, Arc<PriceLevel>>,
+    pub(super) asks: SkipMap<u128, Arc<PriceLevel>>,
 
     /// A concurrent map from order ID to (price, side) for fast lookups
     /// This avoids having to search through all price levels to find an order
-    pub(super) order_locations: DashMap<OrderId, (u64, Side)>,
+    pub(super) order_locations: DashMap<OrderId, (u128, Side)>,
+
+    /// A concurrent map from user ID to their order IDs for fast lookup
+    #[allow(dead_code)]
+    pub(super) user_orders: DashMap<Hash32, Vec<OrderId>>,
 
     /// Generator for unique transaction IDs
     pub(super) transaction_id_generator: UuidGenerator,
 
+    /// Counter for generating sequential order IDs
+    #[allow(dead_code)]
+    pub(super) next_order_id: AtomicU64,
+
     /// The last price at which a trade occurred
-    pub(super) last_trade_price: AtomicU64,
+    pub(super) last_trade_price: AtomicCell<u128>,
 
     /// Flag indicating if there was a trade
     pub(super) has_traded: AtomicBool,
@@ -72,6 +85,10 @@ pub struct OrderBook<T = ()> {
 
     /// listens to order book changes. This provides a point to update a corresponding external order book e.g. in the UI
     pub price_level_changed_listener: Option<PriceLevelChangedListener>,
+
+    /// Tracker for special orders that require re-pricing (PeggedOrder and TrailingStop)
+    #[cfg(feature = "special_orders")]
+    pub(super) special_order_tracker: SpecialOrderTracker,
 }
 
 impl<T> Serialize for OrderBook<T>
@@ -91,16 +108,16 @@ where
         // Serialize symbol
         state.serialize_field("symbol", &self.symbol)?;
 
-        // Serialize bids as HashMap<u64, PriceLevel> using snapshots
-        let bids: HashMap<u64, _> = self
+        // Serialize bids as HashMap<u128, PriceLevel> using snapshots
+        let bids: HashMap<u128, _> = self
             .bids
             .iter()
             .map(|entry| (*entry.key(), entry.value().snapshot()))
             .collect();
         state.serialize_field("bids", &bids)?;
 
-        // Serialize asks as HashMap<u64, PriceLevel> using snapshots
-        let asks: HashMap<u64, _> = self
+        // Serialize asks as HashMap<u128, PriceLevel> using snapshots
+        let asks: HashMap<u128, _> = self
             .asks
             .iter()
             .map(|entry| (*entry.key(), entry.value().snapshot()))
@@ -108,7 +125,7 @@ where
         state.serialize_field("asks", &asks)?;
 
         // Serialize order_locations as HashMap
-        let order_locations: HashMap<OrderId, (u64, Side)> = self
+        let order_locations: HashMap<OrderId, (u128, Side)> = self
             .order_locations
             .iter()
             .map(|entry| (*entry.key(), *entry.value()))
@@ -116,10 +133,7 @@ where
         state.serialize_field("order_locations", &order_locations)?;
 
         // Serialize atomic values by loading them
-        state.serialize_field(
-            "last_trade_price",
-            &self.last_trade_price.load(Ordering::Relaxed),
-        )?;
+        state.serialize_field("last_trade_price", &self.last_trade_price.load())?;
         state.serialize_field("has_traded", &self.has_traded.load(Ordering::Relaxed))?;
         state.serialize_field(
             "market_close_timestamp",
@@ -154,6 +168,7 @@ where
                 price,
                 quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 ..
@@ -162,6 +177,7 @@ where
                 price: *price,
                 quantity: *quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 extra_fields: T::default(),
@@ -172,6 +188,7 @@ where
                 visible_quantity,
                 hidden_quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 ..
@@ -181,6 +198,7 @@ where
                 visible_quantity: *visible_quantity,
                 hidden_quantity: *hidden_quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 extra_fields: T::default(),
@@ -190,6 +208,7 @@ where
                 price,
                 quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 ..
@@ -198,6 +217,7 @@ where
                 price: *price,
                 quantity: *quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 extra_fields: T::default(),
@@ -207,6 +227,7 @@ where
                 price,
                 quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 trail_amount,
@@ -217,6 +238,7 @@ where
                 price: *price,
                 quantity: *quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 trail_amount: *trail_amount,
@@ -228,6 +250,7 @@ where
                 price,
                 quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 reference_price_offset,
@@ -238,6 +261,7 @@ where
                 price: *price,
                 quantity: *quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 reference_price_offset: *reference_price_offset,
@@ -249,6 +273,7 @@ where
                 price,
                 quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 ..
@@ -257,6 +282,7 @@ where
                 price: *price,
                 quantity: *quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 extra_fields: T::default(),
@@ -267,6 +293,7 @@ where
                 visible_quantity,
                 hidden_quantity,
                 side,
+                user_id,
                 timestamp,
                 time_in_force,
                 replenish_threshold,
@@ -279,6 +306,7 @@ where
                 visible_quantity: *visible_quantity,
                 hidden_quantity: *hidden_quantity,
                 side: *side,
+                user_id: *user_id,
                 timestamp: *timestamp,
                 time_in_force: *time_in_force,
                 replenish_threshold: *replenish_threshold,
@@ -298,8 +326,10 @@ where
             bids: SkipMap::new(),
             asks: SkipMap::new(),
             order_locations: DashMap::new(),
+            user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            last_trade_price: AtomicU64::new(0),
+            next_order_id: AtomicU64::new(1),
+            last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
@@ -307,6 +337,8 @@ where
             trade_listener: None,
             _phantom: PhantomData,
             price_level_changed_listener: None,
+            #[cfg(feature = "special_orders")]
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -319,8 +351,10 @@ where
             bids: SkipMap::new(),
             asks: SkipMap::new(),
             order_locations: DashMap::new(),
+            user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            last_trade_price: AtomicU64::new(0),
+            next_order_id: AtomicU64::new(1),
+            last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
@@ -328,6 +362,8 @@ where
             trade_listener: Some(trade_listener),
             _phantom: PhantomData,
             price_level_changed_listener: None,
+            #[cfg(feature = "special_orders")]
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -352,8 +388,10 @@ where
             bids: SkipMap::new(),
             asks: SkipMap::new(),
             order_locations: DashMap::new(),
+            user_orders: DashMap::new(),
             transaction_id_generator: UuidGenerator::new(namespace),
-            last_trade_price: AtomicU64::new(0),
+            next_order_id: AtomicU64::new(1),
+            last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
@@ -361,6 +399,8 @@ where
             trade_listener: Some(trade_listener),
             _phantom: PhantomData,
             price_level_changed_listener: Some(book_changed_listener),
+            #[cfg(feature = "special_orders")]
+            special_order_tracker: SpecialOrderTracker::new(),
         }
     }
 
@@ -409,7 +449,7 @@ where
     ///
     /// # Performance
     /// O(1) operation using SkipMap's ordered structure (highest price is last)
-    pub fn best_bid(&self) -> Option<u64> {
+    pub fn best_bid(&self) -> Option<u128> {
         if let Some(cached_bid) = self.cache.get_cached_best_bid() {
             return Some(cached_bid);
         }
@@ -426,7 +466,7 @@ where
     ///
     /// # Performance
     /// O(1) operation using SkipMap's ordered structure (lowest price is first)
-    pub fn best_ask(&self) -> Option<u64> {
+    pub fn best_ask(&self) -> Option<u128> {
         if let Some(cached_ask) = self.cache.get_cached_best_ask() {
             return Some(cached_ask);
         }
@@ -451,16 +491,16 @@ where
     }
 
     /// Get the last trade price, if any
-    pub fn last_trade_price(&self) -> Option<u64> {
+    pub fn last_trade_price(&self) -> Option<u128> {
         if self.has_traded.load(Ordering::Relaxed) {
-            Some(self.last_trade_price.load(Ordering::Relaxed))
+            Some(self.last_trade_price.load())
         } else {
             None
         }
     }
 
     /// Get the spread (best ask - best bid)
-    pub fn spread(&self) -> Option<u64> {
+    pub fn spread(&self) -> Option<u128> {
         match (
             OrderBook::<T>::best_bid(self),
             OrderBook::<T>::best_ask(self),
@@ -496,7 +536,7 @@ where
     /// }
     /// ```
     #[must_use]
-    pub fn price_at_depth(&self, target_depth: u64, side: Side) -> Option<u64> {
+    pub fn price_at_depth(&self, target_depth: u64, side: Side) -> Option<u128> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
@@ -552,7 +592,7 @@ where
     /// }
     /// ```
     #[must_use]
-    pub fn cumulative_depth_to_target(&self, target_depth: u64, side: Side) -> Option<(u64, u64)> {
+    pub fn cumulative_depth_to_target(&self, target_depth: u64, side: Side) -> Option<(u128, u64)> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
@@ -663,7 +703,7 @@ where
     /// }
     /// ```
     #[must_use]
-    pub fn spread_absolute(&self) -> Option<u64> {
+    pub fn spread_absolute(&self) -> Option<u128> {
         self.spread()
     }
 
@@ -784,7 +824,7 @@ where
             }
 
             let fill_qty = remaining.min(available);
-            total_cost = total_cost.saturating_add((price as u128) * (fill_qty as u128));
+            total_cost = total_cost.saturating_add(price * (fill_qty as u128));
             total_filled = total_filled.saturating_add(fill_qty);
             remaining = remaining.saturating_sub(fill_qty);
         }
@@ -987,7 +1027,7 @@ where
 
             levels_consumed += 1;
             let fill_qty = remaining.min(available);
-            total_cost = total_cost.saturating_add((price as u128) * (fill_qty as u128));
+            total_cost = total_cost.saturating_add(price * (fill_qty as u128));
             total_filled = total_filled.saturating_add(fill_qty);
             worst_price = price;
             remaining = remaining.saturating_sub(fill_qty);
@@ -1098,7 +1138,7 @@ where
             }
 
             let fill_qty = remaining.min(available);
-            total_cost = total_cost.saturating_add((price as u128) * (fill_qty as u128));
+            total_cost = total_cost.saturating_add(price * (fill_qty as u128));
             total_filled = total_filled.saturating_add(fill_qty);
             fills.push((price, fill_qty));
             remaining = remaining.saturating_sub(fill_qty);
@@ -1149,7 +1189,7 @@ where
     /// assert_eq!(liquidity, 25); // 10 + 15
     /// ```
     #[must_use]
-    pub fn liquidity_in_range(&self, min_price: u64, max_price: u64, side: Side) -> u64 {
+    pub fn liquidity_in_range(&self, min_price: u128, max_price: u128, side: Side) -> u64 {
         if min_price > max_price {
             return 0;
         }
@@ -1212,7 +1252,7 @@ where
     /// assert_eq!(orders_ahead, 2);
     /// ```
     #[must_use]
-    pub fn queue_ahead_at_price(&self, price: u64, side: Side) -> usize {
+    pub fn queue_ahead_at_price(&self, price: u128, side: Side) -> usize {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
@@ -1263,12 +1303,17 @@ where
     /// }
     /// ```
     #[must_use]
-    pub fn price_n_ticks_inside(&self, n_ticks: usize, tick_size: u64, side: Side) -> Option<u64> {
+    pub fn price_n_ticks_inside(
+        &self,
+        n_ticks: usize,
+        tick_size: u128,
+        side: Side,
+    ) -> Option<u128> {
         if n_ticks == 0 || tick_size == 0 {
             return None;
         }
 
-        let adjustment = (n_ticks as u64).checked_mul(tick_size)?;
+        let adjustment = (n_ticks as u128).checked_mul(tick_size)?;
 
         match side {
             Side::Buy => {
@@ -1314,7 +1359,7 @@ where
     /// assert_eq!(book.price_for_queue_position(2, Side::Buy), Some(99));
     /// ```
     #[must_use]
-    pub fn price_for_queue_position(&self, position: usize, side: Side) -> Option<u64> {
+    pub fn price_for_queue_position(&self, position: usize, side: Side) -> Option<u128> {
         if position == 0 {
             return None;
         }
@@ -1385,9 +1430,9 @@ where
     pub fn price_at_depth_adjusted(
         &self,
         target_depth: u64,
-        tick_size: u64,
+        tick_size: u128,
         side: Side,
-    ) -> Option<u64> {
+    ) -> Option<u128> {
         if target_depth == 0 || tick_size == 0 {
             return None;
         }
@@ -1551,7 +1596,12 @@ where
     ///     .sum();
     /// println!("Total quantity in range: {}", total_qty);
     /// ```
-    pub fn levels_in_range(&self, min_price: u64, max_price: u64, side: Side) -> LevelsInRange<'_> {
+    pub fn levels_in_range(
+        &self,
+        min_price: u128,
+        max_price: u128,
+        side: Side,
+    ) -> LevelsInRange<'_> {
         let price_levels = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
@@ -1606,7 +1656,7 @@ where
     }
 
     /// Get all orders at a specific price level
-    pub fn get_orders_at_price(&self, price: u64, side: Side) -> Vec<Arc<OrderType<T>>>
+    pub fn get_orders_at_price(&self, price: u128, side: Side) -> Vec<Arc<OrderType<T>>>
     where
         T: Default,
     {
@@ -1753,7 +1803,7 @@ where
         order_id: OrderId,
         quantity: u64,
         side: Side,
-        limit_price: u64,
+        limit_price: u128,
     ) -> Result<MatchResult, OrderBookError> {
         trace!(
             "Order book {}: Matching limit order {} for {} at side {:?} with limit price {}",
@@ -1776,12 +1826,12 @@ where
     /// Create a snapshot of the current order book state
     pub fn create_snapshot(&self, depth: usize) -> OrderBookSnapshot {
         // Get all bid prices and sort them in descending order
-        let mut bid_prices: Vec<u64> = self.bids.iter().map(|item| *item.key()).collect();
+        let mut bid_prices: Vec<u128> = self.bids.iter().map(|item| *item.key()).collect();
         bid_prices.sort_by(|a, b| b.cmp(a)); // Descending order
         bid_prices.truncate(depth);
 
         // Get all ask prices and sort them in ascending order
-        let mut ask_prices: Vec<u64> = self.asks.iter().map(|item| *item.key()).collect();
+        let mut ask_prices: Vec<u128> = self.asks.iter().map(|item| *item.key()).collect();
         ask_prices.sort(); // Ascending order
         ask_prices.truncate(depth);
 
@@ -1860,7 +1910,7 @@ where
         }
         self.order_locations.clear();
         self.has_traded.store(false, Ordering::Relaxed);
-        self.last_trade_price.store(0, Ordering::Relaxed);
+        self.last_trade_price.store(0);
         self.has_market_close.store(false, Ordering::Relaxed);
         self.market_close_timestamp.store(0, Ordering::Relaxed);
 
@@ -1978,12 +2028,12 @@ where
         flags: MetricFlags,
     ) -> EnrichedSnapshot {
         // Get all bid prices and sort them in descending order
-        let mut bid_prices: Vec<u64> = self.bids.iter().map(|item| *item.key()).collect();
+        let mut bid_prices: Vec<u128> = self.bids.iter().map(|item| *item.key()).collect();
         bid_prices.sort_by(|a, b| b.cmp(a)); // Descending order
         bid_prices.truncate(depth);
 
         // Get all ask prices and sort them in ascending order
-        let mut ask_prices: Vec<u64> = self.asks.iter().map(|item| *item.key()).collect();
+        let mut ask_prices: Vec<u128> = self.asks.iter().map(|item| *item.key()).collect();
         ask_prices.sort(); // Ascending order
         ask_prices.truncate(depth);
 
@@ -2017,7 +2067,7 @@ where
     }
 
     /// Get the total volume at each price level
-    pub fn get_volume_by_price(&self) -> (HashMap<u64, u64>, HashMap<u64, u64>) {
+    pub fn get_volume_by_price(&self) -> (HashMap<u128, u64>, HashMap<u128, u64>) {
         let mut bid_volumes = HashMap::new();
         let mut ask_volumes = HashMap::new();
 
@@ -2042,7 +2092,7 @@ where
     ///
     /// # Note
     /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_bids(&self) -> Arc<DashMap<u64, Arc<PriceLevel>>> {
+    pub fn get_bids(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
         let map = DashMap::new();
         for entry in self.bids.iter() {
             map.insert(*entry.key(), entry.value().clone());
@@ -2054,7 +2104,7 @@ where
     ///
     /// # Note
     /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_asks(&self) -> Arc<DashMap<u64, Arc<PriceLevel>>> {
+    pub fn get_asks(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
         let map = DashMap::new();
         for entry in self.asks.iter() {
             map.insert(*entry.key(), entry.value().clone());
@@ -2063,7 +2113,7 @@ where
     }
 
     /// Get a BTreeMap of bids with price as key and PriceLevel as value
-    pub fn get_bt_bids(&self) -> BTreeMap<u64, PriceLevel> {
+    pub fn get_bt_bids(&self) -> BTreeMap<u128, PriceLevel> {
         self.bids
             .iter()
             .map(|entry| {
@@ -2076,7 +2126,7 @@ where
     }
 
     /// Get a BTreeMap of asks with price as key and PriceLevel as value
-    pub fn get_bt_asks(&self) -> BTreeMap<u64, PriceLevel> {
+    pub fn get_bt_asks(&self) -> BTreeMap<u128, PriceLevel> {
         self.asks
             .iter()
             .map(|entry| {
@@ -2089,7 +2139,7 @@ where
     }
 
     /// Get an Arc reference to the order_locations DashMap
-    pub fn get_order_locations_arc(&self) -> Arc<DashMap<OrderId, (u64, Side)>> {
+    pub fn get_order_locations_arc(&self) -> Arc<DashMap<OrderId, (u128, Side)>> {
         Arc::new(self.order_locations.clone())
     }
 
@@ -2141,7 +2191,7 @@ where
         };
 
         let mut total_volume = 0u64;
-        let mut weighted_price_sum = 0u64;
+        let mut weighted_price_sum = 0u128;
         let mut sizes = Vec::new();
         let mut min_size = u64::MAX;
         let mut max_size = 0u64;
@@ -2160,7 +2210,8 @@ where
             }
 
             total_volume = total_volume.saturating_add(quantity);
-            weighted_price_sum = weighted_price_sum.saturating_add(price.saturating_mul(quantity));
+            weighted_price_sum =
+                weighted_price_sum.saturating_add(price.saturating_mul(quantity as u128));
             sizes.push(quantity);
             min_size = min_size.min(quantity);
             max_size = max_size.max(quantity);
@@ -2328,8 +2379,8 @@ where
         }
 
         // Find min and max prices
-        let mut min_price = u64::MAX;
-        let mut max_price = 0u64;
+        let mut min_price = u128::MAX;
+        let mut max_price = 0u128;
 
         for entry in price_levels.iter() {
             let price = *entry.key();
@@ -2337,7 +2388,7 @@ where
             max_price = max_price.max(price);
         }
 
-        if min_price == u64::MAX || max_price < min_price {
+        if min_price == u128::MAX || max_price < min_price {
             return Vec::new();
         }
 
@@ -2346,13 +2397,13 @@ where
         let bin_width = if price_range == 0 {
             1
         } else {
-            price_range.div_ceil(bins as u64) // Ceiling division
+            price_range.div_ceil(bins as u128) // Ceiling division
         };
 
         // Initialize bins
         let mut distribution = Vec::with_capacity(bins);
         for i in 0..bins {
-            let bin_min = min_price + (i as u64 * bin_width);
+            let bin_min = min_price + (i as u128 * bin_width);
             let bin_max = if i == bins - 1 {
                 max_price + 1 // Make last bin inclusive
             } else {
@@ -2380,7 +2431,7 @@ where
             let bin_index = if price >= max_price {
                 bins - 1
             } else {
-                ((price - min_price) / bin_width).min((bins - 1) as u64) as usize
+                ((price - min_price) / bin_width).min((bins - 1) as u128) as usize
             };
 
             distribution[bin_index].volume =
@@ -2389,5 +2440,203 @@ where
         }
 
         distribution
+    }
+}
+
+// Implementation of RepricingOperations trait for OrderBook
+#[cfg(feature = "special_orders")]
+use crate::orderbook::repricing::{
+    RepricingOperations, RepricingResult, calculate_pegged_price, calculate_trailing_stop_price,
+};
+
+#[cfg(feature = "special_orders")]
+impl<T> RepricingOperations<T> for OrderBook<T>
+where
+    T: Clone + Default + Send + Sync + 'static,
+{
+    /// Re-prices all pegged orders based on current market conditions
+    fn reprice_pegged_orders(&self) -> Result<usize, OrderBookError> {
+        let pegged_ids = self.special_order_tracker.pegged_order_ids();
+        if pegged_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let best_bid = self.best_bid();
+        let best_ask = self.best_ask();
+        let mid_price = self.mid_price().map(|p| p as u128);
+        let last_trade = if self.has_traded.load(Ordering::Relaxed) {
+            Some(self.last_trade_price.load())
+        } else {
+            None
+        };
+
+        let mut repriced_count = 0;
+
+        for order_id in pegged_ids {
+            if let Some(order) = self.get_order(order_id) {
+                if let OrderType::PeggedOrder {
+                    price: current_price,
+                    side,
+                    reference_price_offset,
+                    reference_price_type,
+                    ..
+                } = order.as_ref()
+                    && let Some(new_price) = calculate_pegged_price(
+                        *reference_price_type,
+                        *reference_price_offset,
+                        *side,
+                        best_bid,
+                        best_ask,
+                        mid_price,
+                        last_trade,
+                    )
+                    && new_price != *current_price
+                {
+                    let update = OrderUpdate::UpdatePrice {
+                        order_id,
+                        new_price,
+                    };
+                    if self.update_order(update).is_ok() {
+                        repriced_count += 1;
+                        trace!(
+                            "Re-priced pegged order {} from {} to {}",
+                            order_id, current_price, new_price
+                        );
+                    }
+                }
+            } else {
+                // Order no longer exists, unregister it
+                self.special_order_tracker
+                    .unregister_pegged_order(&order_id);
+            }
+        }
+
+        Ok(repriced_count)
+    }
+
+    /// Re-prices all trailing stop orders based on current market conditions
+    fn reprice_trailing_stops(&self) -> Result<usize, OrderBookError> {
+        let trailing_ids = self.special_order_tracker.trailing_stop_ids();
+        if trailing_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut repriced_count = 0;
+
+        for order_id in trailing_ids {
+            if let Some(order) = self.get_order(order_id) {
+                if let OrderType::TrailingStop {
+                    price: current_stop_price,
+                    side,
+                    trail_amount,
+                    last_reference_price,
+                    ..
+                } = order.as_ref()
+                {
+                    // Get current market price based on side
+                    let current_market_price = match side {
+                        Side::Sell => self.best_bid(), // Sell stop tracks bid (market high)
+                        Side::Buy => self.best_ask(),  // Buy stop tracks ask (market low)
+                    };
+
+                    if let Some(market_price) = current_market_price
+                        && let Some((new_stop_price, new_reference)) = calculate_trailing_stop_price(
+                            *side,
+                            *current_stop_price,
+                            *trail_amount,
+                            *last_reference_price,
+                            market_price,
+                        )
+                    {
+                        // Update the order with new stop price
+                        // We need to update both price and last_reference_price
+                        // For now, we update the price; the reference price update
+                        // requires modifying the order directly
+                        let update = OrderUpdate::UpdatePrice {
+                            order_id,
+                            new_price: new_stop_price,
+                        };
+                        if self.update_order(update).is_ok() {
+                            repriced_count += 1;
+                            trace!(
+                                "Re-priced trailing stop {} from {} to {} (ref: {} -> {})",
+                                order_id,
+                                current_stop_price,
+                                new_stop_price,
+                                last_reference_price,
+                                new_reference
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Order no longer exists, unregister it
+                self.special_order_tracker
+                    .unregister_trailing_stop(&order_id);
+            }
+        }
+
+        Ok(repriced_count)
+    }
+
+    /// Re-prices all special orders (both pegged and trailing stops)
+    fn reprice_special_orders(&self) -> Result<RepricingResult, OrderBookError> {
+        let pegged_count = self.reprice_pegged_orders()?;
+        let trailing_count = self.reprice_trailing_stops()?;
+
+        Ok(RepricingResult {
+            pegged_orders_repriced: pegged_count,
+            trailing_stops_repriced: trailing_count,
+            failed_orders: Vec::new(),
+        })
+    }
+
+    /// Checks if a trailing stop order should be triggered
+    fn should_trigger_trailing_stop(
+        &self,
+        order: &OrderType<T>,
+        current_market_price: u128,
+    ) -> bool {
+        if let OrderType::TrailingStop {
+            price: stop_price,
+            side,
+            ..
+        } = order
+        {
+            match side {
+                // Sell trailing stop triggers when market falls to or below stop price
+                Side::Sell => current_market_price <= *stop_price,
+                // Buy trailing stop triggers when market rises to or above stop price
+                Side::Buy => current_market_price >= *stop_price,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(feature = "special_orders")]
+impl<T> OrderBook<T>
+where
+    T: Clone + Default + Send + Sync + 'static,
+{
+    /// Returns the number of tracked pegged orders
+    pub fn pegged_order_count(&self) -> usize {
+        self.special_order_tracker.pegged_order_count()
+    }
+
+    /// Returns the number of tracked trailing stop orders
+    pub fn trailing_stop_count(&self) -> usize {
+        self.special_order_tracker.trailing_stop_count()
+    }
+
+    /// Returns all tracked pegged order IDs
+    pub fn pegged_order_ids(&self) -> Vec<OrderId> {
+        self.special_order_tracker.pegged_order_ids()
+    }
+
+    /// Returns all tracked trailing stop order IDs
+    pub fn trailing_stop_ids(&self) -> Vec<OrderId> {
+        self.special_order_tracker.trailing_stop_ids()
     }
 }
