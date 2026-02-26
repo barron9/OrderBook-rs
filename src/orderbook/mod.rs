@@ -36,6 +36,9 @@ pub mod fees;
 /// Mass cancel operations for bulk order removal.
 pub mod mass_cancel;
 
+/// Pluggable event serialization for NATS publishers and consumers.
+pub mod serialization;
+
 /// NATS JetStream trade event publisher.
 #[cfg(feature = "nats")]
 pub mod nats;
@@ -58,6 +61,9 @@ pub use mass_cancel::MassCancelResult;
 pub use nats::NatsTradePublisher;
 #[cfg(feature = "special_orders")]
 pub use repricing::{RepricingOperations, RepricingResult, SpecialOrderTracker};
+#[cfg(feature = "bincode")]
+pub use serialization::BincodeEventSerializer;
+pub use serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use snapshot::{
     EnrichedSnapshot, MetricFlags, ORDERBOOK_SNAPSHOT_FORMAT_VERSION, OrderBookSnapshot,
     OrderBookSnapshotPackage,

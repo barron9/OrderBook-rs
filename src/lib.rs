@@ -237,6 +237,8 @@ pub mod orderbook;
 pub mod prelude;
 mod utils;
 
+#[cfg(feature = "bincode")]
+pub use orderbook::BincodeEventSerializer;
 #[cfg(feature = "nats")]
 pub use orderbook::NatsTradePublisher;
 pub use orderbook::implied_volatility::{
@@ -246,6 +248,7 @@ pub use orderbook::implied_volatility::{
 pub use orderbook::iterators::LevelInfo;
 pub use orderbook::manager::{BookManager, BookManagerStd, BookManagerTokio};
 pub use orderbook::market_impact::{MarketImpact, OrderSimulation};
+pub use orderbook::serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use orderbook::snapshot::{EnrichedSnapshot, MetricFlags};
 pub use orderbook::statistics::{DepthStats, DistributionBin};
 pub use orderbook::stp::STPMode;

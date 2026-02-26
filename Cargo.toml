@@ -41,11 +41,13 @@ tokio = { workspace = true, features = ["sync", "rt"] }
 bitflags = { workspace = true }
 async-nats = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
 
 [features]
 default = []
 special_orders = []
 nats = ["dep:async-nats", "dep:bytes"]
+bincode = ["dep:bincode"]
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -86,3 +88,4 @@ bitflags = { version = "2.10", features = ["serde"] }
 tracing-subscriber = "0.3"
 async-nats = "0.46"
 bytes = "1"
+bincode = "1"

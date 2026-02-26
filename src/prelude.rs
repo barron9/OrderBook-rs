@@ -41,6 +41,13 @@ pub use crate::orderbook::trade::{
 // Order types and enums from pricelevel
 pub use pricelevel::{OrderId, OrderType, Side, TimeInForce};
 
+// Event serialization types
+#[cfg(feature = "bincode")]
+pub use crate::orderbook::serialization::BincodeEventSerializer;
+pub use crate::orderbook::serialization::{
+    EventSerializer, JsonEventSerializer, SerializationError,
+};
+
 // NATS integration types
 #[cfg(feature = "nats")]
 pub use crate::orderbook::nats::NatsTradePublisher;
